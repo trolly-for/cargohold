@@ -2,74 +2,78 @@ package bundle
 
 import (
 	"encoding/json"
-	"fmt"
+	"errors"
 	"os"
-	"time"
+
+	"github.com/cargohold/cargohold/internal/crypto"
 )
 
-// Bundle represents a named collection of secrets for a specific environment.
+// Bundle holds a named collection of key-value secret pairs.
 type Bundle struct {
-	Name      string            `json:"name"`
-	Env       string            `json:"env"`
-	Secrets   map[string]string `json:"secrets"`
-	CreatedAt time.Time         `json:"created_at"`
-	UpdatedAt time.Time         `json:"updated_at"`
+	Name    string            `json:"name"`
+	Secrets map[string]string `json:"secrets"`
 }
 
-// New creates a new empty Bundle with the given name and environment.
-func New(name, env string) *Bundle {
-	now := time.Now().UTC()
+// New creates a new empty Bundle with the given name.
+func New(name string) *Bundle {
 	return &Bundle{
-		Name:      name,
-		Env:       env,
-		Secrets:   make(map[string]string),
-		CreatedAt: now,
-		UpdatedAt: now,
+		Name:    name,
+		Secrets: make(map[string]string),
 	}
 }
 
 // Set adds or updates a secret key-value pair in the bundle.
 func (b *Bundle) Set(key, value string) {
 	b.Secrets[key] = value
-	b.UpdatedAt = time.Now().UTC()
 }
 
-// Get retrieves a secret value by key. Returns an error if the key does not exist.
+// Get retrieves a secret value by key. Returns an error if not found.
 func (b *Bundle) Get(key string) (string, error) {
-	v, ok := b.Secrets[key]
+	val, ok := b.Secrets[key]
 	if !ok {
-		return "", fmt.Errorf("key %q not found in bundle %q", key, b.Name)
+		return "", errors.New("key not found: " + key)
 	}
-	return v, nil
+	return val, nil
 }
 
 // Delete removes a secret key from the bundle.
 func (b *Bundle) Delete(key string) {
 	delete(b.Secrets, key)
-	b.UpdatedAt = time.Now().UTC()
 }
 
-// SaveToFile serialises the bundle as JSON and writes it to path.
-func (b *Bundle) SaveToFile(path string) error {
-	data, err := json.MarshalIndent(b, "", "  ")
+// Save encrypts and writes the bundle to the given file path using the passphrase.
+func (b *Bundle) Save(path, passphrase string) error {
+	data, err := json.Marshal(b)
 	if err != nil {
-		return fmt.Errorf("marshal bundle: %w", err)
+		return err
 	}
-	if err := os.WriteFile(path, data, 0600); err != nil {
-		return fmt.Errorf("write bundle file: %w", err)
+
+	key := crypto.DeriveKey(passphrase)
+	ciphertext, err := crypto.Encrypt(key, data)
+	if err != nil {
+		return err
 	}
-	return nil
+
+	return os.WriteFile(path, ciphertext, 0600)
 }
 
-// LoadFromFile reads a JSON bundle file from path and returns a Bundle.
-func LoadFromFile(path string) (*Bundle, error) {
-	data, err := os.ReadFile(path)
+// Load reads and decrypts a bundle from the given file path using the passphrase.
+func Load(path, passphrase string) (*Bundle, error) {
+	ciphertext, err := os.ReadFile(path)
 	if err != nil {
-		return nil, fmt.Errorf("read bundle file: %w", err)
+		return nil, err
 	}
+
+	key := crypto.DeriveKey(passphrase)
+	data, err := crypto.Decrypt(key, ciphertext)
+	if err != nil {
+		return nil, err
+	}
+
 	var b Bundle
 	if err := json.Unmarshal(data, &b); err != nil {
-		return nil, fmt.Errorf("unmarshal bundle: %w", err)
+		return nil, err
 	}
+
 	return &b, nil
 }
