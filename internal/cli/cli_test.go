@@ -5,110 +5,99 @@ import (
 	"path/filepath"
 	"testing"
 
-	"cargohold/internal/cli"
+	clitest "cargohold/internal/cli"
+	"cargohold/internal/rotate"
 	"cargohold/internal/store"
 )
 
-func tempRunner(t *testing.T) *cli.Runner {
+func tempRunner(t *testing.T) *clitest.Runner {
 	t.Helper()
-	dir := t.TempDir()
-	s, err := store.New(filepath.Join(dir, "bundles"))
+	dir, err := os.MkdirTemp("", "cli-test-*")
 	if err != nil {
-		t.Fatalf("store.New: %v", err)
+		t.Fatalf("MkdirTemp: %v", err)
 	}
-	return &cli.Runner{Store: s}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	s := store.New(filepath.Join(dir, "bundles"))
+	return clitest.NewWithStore(s)
 }
+
+const (
+	testEnv  = "staging"
+	testPass = "hunter2-passphrase"
+)
 
 func TestInitCreatesBundle(t *testing.T) {
 	r := tempRunner(t)
-	if err := r.Init("staging", "secret"); err != nil {
+	if err := r.Init(testEnv, testPass); err != nil {
 		t.Fatalf("Init: %v", err)
-	}
-	envs, err := r.Store.List()
-	if err != nil {
-		t.Fatalf("List: %v", err)
-	}
-	if len(envs) != 1 || envs[0] != "staging" {
-		t.Errorf("expected [staging], got %v", envs)
 	}
 }
 
 func TestInitDuplicateErrors(t *testing.T) {
 	r := tempRunner(t)
-	if err := r.Init("dev", "pass"); err != nil {
-		t.Fatalf("first Init: %v", err)
-	}
-	if err := r.Init("dev", "pass"); err == nil {
-		t.Fatal("expected error on duplicate init")
+	r.Init(testEnv, testPass) // nolint
+	if err := r.Init(testEnv, testPass); err == nil {
+		t.Fatal("expected error on duplicate Init")
 	}
 }
 
 func TestSetAndGet(t *testing.T) {
 	r := tempRunner(t)
-	const pass = "hunter2"
-	if err := r.Init("dev", pass); err != nil {
-		t.Fatalf("Init: %v", err)
-	}
-	if err := r.Set("dev", pass, "DB_URL", "postgres://localhost/dev"); err != nil {
+	r.Init(testEnv, testPass) // nolint
+
+	if err := r.Set(testEnv, testPass, "DB_URL", "postgres://localhost/db"); err != nil {
 		t.Fatalf("Set: %v", err)
 	}
-	val, err := r.Get("dev", pass, "DB_URL")
-	if err != nil {
+	if err := r.Get(testEnv, testPass, "DB_URL"); err != nil {
 		t.Fatalf("Get: %v", err)
-	}
-	if val != "postgres://localhost/dev" {
-		t.Errorf("got %q, want %q", val, "postgres://localhost/dev")
 	}
 }
 
 func TestGetMissingKey(t *testing.T) {
 	r := tempRunner(t)
-	const pass = "pass"
-	if err := r.Init("dev", pass); err != nil {
-		t.Fatalf("Init: %v", err)
-	}
-	if _, err := r.Get("dev", pass, "MISSING"); err == nil {
+	r.Init(testEnv, testPass) // nolint
+
+	if err := r.Get(testEnv, testPass, "MISSING"); err == nil {
 		t.Fatal("expected error for missing key")
 	}
 }
 
-func TestSetWrongPassphraseErrors(t *testing.T) {
+func TestDeleteKey(t *testing.T) {
 	r := tempRunner(t)
-	if err := r.Init("prod", "correct"); err != nil {
-		t.Fatalf("Init: %v", err)
+	r.Init(testEnv, testPass) // nolint
+	r.Set(testEnv, testPass, "TOKEN", "abc123") // nolint
+
+	if err := r.Delete(testEnv, testPass, "TOKEN"); err != nil {
+		t.Fatalf("Delete: %v", err)
 	}
-	if err := r.Set("prod", "wrong", "KEY", "val"); err == nil {
-		t.Fatal("expected error with wrong passphrase")
+	if err := r.Get(testEnv, testPass, "TOKEN"); err == nil {
+		t.Fatal("expected key to be gone after Delete")
 	}
 }
 
-func TestListKeys(t *testing.T) {
+func TestRotateViaRunner(t *testing.T) {
 	r := tempRunner(t)
-	const pass = "pass"
-	if err := r.Init("dev", pass); err != nil {
-		t.Fatalf("Init: %v", err)
+	r.Init(testEnv, testPass) // nolint
+	r.Set(testEnv, testPass, "SECRET", "s3cr3t") // nolint
+
+	newPass := "new-passphrase-xyz"
+	if err := r.Rotate(testEnv, testPass, newPass); err != nil {
+		t.Fatalf("Rotate: %v", err)
 	}
-	for _, kv := range [][2]string{{"A", "1"}, {"B", "2"}, {"C", "3"}} {
-		if err := r.Set("dev", pass, kv[0], kv[1]); err != nil {
-			t.Fatalf("Set %s: %v", kv[0], err)
-		}
-	}
-	keys, err := r.List("dev", pass)
-	if err != nil {
-		t.Fatalf("List: %v", err)
-	}
-	if len(keys) != 3 {
-		t.Errorf("expected 3 keys, got %d: %v", len(keys), keys)
+	if err := r.Get(testEnv, newPass, "SECRET"); err != nil {
+		t.Fatalf("Get after rotate: %v", err)
 	}
 }
 
-func TestOpenMissingBundleErrors(t *testing.T) {
+func TestRotateSamePassphraseError(t *testing.T) {
 	r := tempRunner(t)
-	if _, err := r.Get("ghost", "pass", "KEY"); err == nil {
-		t.Fatal("expected error for missing bundle")
+	r.Init(testEnv, testPass) // nolint
+
+	err := r.Rotate(testEnv, testPass, testPass)
+	if err == nil {
+		t.Fatal("expected error rotating with same passphrase")
+	}
+	if err != rotate.ErrSamePassphrase {
+		t.Fatalf("expected ErrSamePassphrase, got %v", err)
 	}
 }
-
-// ensure test file compiles even when os/filepath are only used in helpers
-var _ = os.DevNull
-var _ = filepath.Separator

@@ -1,108 +1,150 @@
-// Package cli provides the command-line interface for cargohold.
+// Package cli wires together the cargohold sub-commands.
 package cli
 
 import (
 	"errors"
 	"fmt"
-	"os"
 
+	"cargohold/internal/bundle"
 	"cargohold/internal/env"
+	"cargohold/internal/output"
+	"cargohold/internal/rotate"
 	"cargohold/internal/store"
 	"cargohold/internal/vault"
 )
 
-// Runner holds the dependencies needed to execute CLI commands.
+// Runner executes cargohold CLI commands.
 type Runner struct {
-	Store *store.Store
-	out   *os.File
+	store     *store.Store
+	formatter *output.Formatter
 }
 
-// New creates a Runner using the default store location.
+// New returns a Runner using the default store location.
 func New() (*Runner, error) {
 	s, err := store.Default()
 	if err != nil {
-		return nil, fmt.Errorf("cli: init store: %w", err)
+		return nil, err
 	}
-	return &Runner{Store: s, out: os.Stdout}, nil
+	return &Runner{store: s, formatter: output.Default()}, nil
 }
 
 // Init creates a new encrypted bundle for the given environment.
 func (r *Runner) Init(environment, passphrase string) error {
-	environment, err := env.Normalize(environment)
+	e, err := env.Normalize(environment)
 	if err != nil {
 		return err
 	}
-	path, err := r.Store.BundlePath(environment)
+	v, err := vault.New(r.store, e)
 	if err != nil {
 		return err
 	}
-	_, err = vault.Init(path, passphrase)
-	if err != nil {
-		return fmt.Errorf("cli: init %s: %w", environment, err)
+	b := bundle.New()
+	if err := v.Init(b, passphrase); err != nil {
+		return err
 	}
-	fmt.Fprintf(r.out, "Initialized bundle for environment %q\n", environment)
+	r.formatter.Success("initialised bundle for environment: " + e)
 	return nil
 }
 
-// Set stores a key/value pair in the named environment bundle.
+// Set encrypts and stores a key/value pair in the named environment bundle.
 func (r *Runner) Set(environment, passphrase, key, value string) error {
-	environment, err := env.Normalize(environment)
+	e, err := env.Normalize(environment)
 	if err != nil {
 		return err
 	}
-	v, err := r.openVault(environment, passphrase)
+	v, err := vault.New(r.store, e)
 	if err != nil {
 		return err
 	}
-	v.Bundle().Set(key, value)
-	if err := v.Save(passphrase); err != nil {
-		return fmt.Errorf("cli: set %s/%s: %w", environment, key, err)
+	b, err := v.Open(passphrase)
+	if err != nil {
+		return err
 	}
-	fmt.Fprintf(r.out, "Set %q in %q\n", key, environment)
+	b.Set(key, value)
+	if err := v.Save(b, passphrase); err != nil {
+		return err
+	}
+	r.formatter.Success(fmt.Sprintf("set %s in %s", key, e))
 	return nil
 }
 
 // Get retrieves a value by key from the named environment bundle.
-func (r *Runner) Get(environment, passphrase, key string) (string, error) {
-	environment, err := env.Normalize(environment)
+func (r *Runner) Get(environment, passphrase, key string) error {
+	e, err := env.Normalize(environment)
 	if err != nil {
-		return "", err
+		return err
 	}
-	v, err := r.openVault(environment, passphrase)
+	v, err := vault.New(r.store, e)
 	if err != nil {
-		return "", err
+		return err
 	}
-	val, ok := v.Bundle().Get(key)
+	b, err := v.Open(passphrase)
+	if err != nil {
+		return err
+	}
+	val, ok := b.Get(key)
 	if !ok {
-		return "", fmt.Errorf("cli: key %q not found in %q", key, environment)
+		return fmt.Errorf("key %q not found in %s", key, e)
 	}
-	return val, nil
+	r.formatter.KeyValue(key, val)
+	return nil
 }
 
 // List prints all keys stored in the named environment bundle.
-func (r *Runner) List(environment, passphrase string) ([]string, error) {
-	environment, err := env.Normalize(environment)
+func (r *Runner) List(environment, passphrase string) error {
+	e, err := env.Normalize(environment)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	v, err := r.openVault(environment, passphrase)
+	v, err := vault.New(r.store, e)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	return v.Bundle().Keys(), nil
+	b, err := v.Open(passphrase)
+	if err != nil {
+		return err
+	}
+	r.formatter.KeyList(b.Keys())
+	return nil
 }
 
-func (r *Runner) openVault(environment, passphrase string) (*vault.Vault, error) {
-	path, err := r.Store.BundlePath(environment)
+// Delete removes a key from the named environment bundle.
+func (r *Runner) Delete(environment, passphrase, key string) error {
+	e, err := env.Normalize(environment)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	if !r.Store.Exists(environment) {
-		return nil, errors.New("cli: bundle not found; run init first")
-	}
-	v, err := vault.Open(path, passphrase)
+	v, err := vault.New(r.store, e)
 	if err != nil {
-		return nil, fmt.Errorf("cli: open %s: %w", environment, err)
+		return err
 	}
-	return v, nil
+	b, err := v.Open(passphrase)
+	if err != nil {
+		return err
+	}
+	if ok := b.Delete(key); !ok {
+		return fmt.Errorf("key %q not found in %s", key, e)
+	}
+	if err := v.Save(b, passphrase); err != nil {
+		return err
+	}
+	r.formatter.Success(fmt.Sprintf("deleted %s from %s", key, e))
+	return nil
+}
+
+// Rotate re-encrypts the named environment bundle under a new passphrase.
+func (r *Runner) Rotate(environment, oldPass, newPass string) error {
+	e, err := env.Normalize(environment)
+	if err != nil {
+		return err
+	}
+	rot := rotate.New(r.store)
+	if err := rot.Rotate(e, oldPass, newPass); err != nil {
+		if errors.Is(err, rotate.ErrSamePassphrase) {
+			return err
+		}
+		return fmt.Errorf("rotate failed: %w", err)
+	}
+	r.formatter.Success(fmt.Sprintf("passphrase rotated for environment: %s", e))
+	return nil
 }
