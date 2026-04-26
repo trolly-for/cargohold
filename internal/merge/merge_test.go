@@ -96,3 +96,23 @@ func TestMergeEmptySourceIsNoop(t *testing.T) {
 		t.Errorf("expected empty result for empty source")
 	}
 }
+
+func TestMergeOverwritePreservesNonConflictingKeys(t *testing.T) {
+	dst := seedBundle(t, map[string]string{"A": "original", "B": "keep"})
+	src := seedBundle(t, map[string]string{"A": "new", "C": "added"})
+
+	res, err := merge.Bundles(dst, src, merge.Options{Overwrite: true})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(res.Overwritten) != 1 || res.Overwritten[0] != "A" {
+		t.Errorf("expected only A overwritten, got %v", res.Overwritten)
+	}
+	if len(res.Added) != 1 || res.Added[0] != "C" {
+		t.Errorf("expected only C added, got %v", res.Added)
+	}
+	val, _ := dst.Get("B")
+	if val != "keep" {
+		t.Errorf("expected B to be unchanged, got %q", val)
+	}
+}
