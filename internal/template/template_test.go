@@ -105,6 +105,9 @@ func TestRenderUnknownFormat(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for unknown format")
 	}
+	if !strings.Contains(err.Error(), "toml") {
+		t.Errorf("error message should mention the bad format, got: %v", err)
+	}
 }
 
 func TestRenderEmptyBundle(t *testing.T) {
